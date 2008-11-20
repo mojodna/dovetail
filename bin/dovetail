@@ -121,7 +121,7 @@ protected
       when :unavailable
         # client has gone offline
 
-        update_presence("unavailable", presence.from.bare.to_s)
+        update_presence("unavailable", presence.from)
 
       when :unsubscribe
         # client wants to unsubscribe from us
@@ -139,7 +139,7 @@ protected
       else
 
         # client is available
-        update_presence((presence.show || :online).to_s, presence.from.bare.to_s)
+        update_presence((presence.show || :online).to_s, presence.from)
 
       end
     end
