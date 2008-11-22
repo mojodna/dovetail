@@ -166,9 +166,18 @@ protected
           resp.type = :result
           resp.pubsub.first_element("items").add(item)
           deliver(resp)
+        elsif create = iq.pubsub.first_element("create")
+          node = create.attributes["node"]
+          puts "Request for node creation: #{node}"
+
+          resp = Jabber::Iq.new(:result, iq.from)
+          resp.from = iq.to # TODO component.domain (elsewhere, too)
+          resp.id = iq.id
+          deliver(resp)
         else
           puts "Received a pubsub message"
           puts iq.to_s
+          # TODO not-supported
           not_implemented(iq)
         end
       else
