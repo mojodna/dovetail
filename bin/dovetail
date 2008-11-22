@@ -163,6 +163,7 @@ protected
           item.add(doc.root || REXML::CData.new(response))
 
           resp = iq.answer
+          resp.type = :result
           resp.pubsub.first_element("items").add(item)
           deliver(resp)
         else
