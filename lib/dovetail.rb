@@ -113,17 +113,43 @@ protected
     if iq.pubsub
       if items = iq.pubsub.first_element("items")
         items = Jabber::PubSub::Items.import(items)
-        puts "Request for items on #{items.node}"
+        puts "Request for items on #{items.node} (#{items.max_items || "all"})"
+        puts items.to_s
 
-        # fetch items from the node url provided
-        url = REXML::Text.unnormalize(items.node)
-        response = open(url).read
+        env = {
+          "REQUEST_METHOD" => "GET",
+          "HTTP_ACCEPT"    => Mime::XML,
+          "CONTENT_TYPE"   => Mime::XML,
+          "REQUEST_URI"    => items.node,
+          "QUERY_STRING"   => "",
+          "RAW_POST_DATA"  => "" # new XML goes here
+        }
+
+        @output = $stdout # (Logging)
+        @request  = ActionController::RackRequest.new(env)
+        @response = ActionController::RackResponse.new(@request)
+
+        @controller = ActionController::Routing::Routes.recognize(@request)
+        @request.path_parameters # => hash containing info about the request
+        @controller.process(@request, @response).out(@output)
+
+        @response.body # => response
+
+        # # fetch items from the node url provided
+        # url = REXML::Text.unnormalize(items.node)
+        # response = open(url).read
+        # 
+        # item = Jabber::PubSub::Item.new
+        # 
+        # # attempt to treat as XML
+        # doc = REXML::Document.new(response)
+        # item.add(doc.root || REXML::CData.new(response))
 
         item = Jabber::PubSub::Item.new
 
         # attempt to treat as XML
-        doc = REXML::Document.new(response)
-        item.add(doc.root || REXML::CData.new(response))
+        doc = REXML::Document.new(@response.body)
+        item.add(doc.root || REXML::CData.new(@response.body))
 
         resp = iq.answer
         resp.type = :result
@@ -138,6 +164,47 @@ protected
         resp = Jabber::Iq.new(:result, iq.from)
         resp.from = iq.to # TODO component.domain (elsewhere, too)
         resp.id = iq.id
+        deliver(resp)
+      elsif publish = iq.pubsub.first_element("publish")
+        publish = Jabber::PubSub::Publish.import(publish)
+        node = publish.node
+        puts "Publishing to node: #{node}"
+        # TODO am I publishing to an existing node or a new node?
+        item = Jabber::PubSub::Item.import(publish.first_element("item"))
+        puts "Data:"
+        data = REXML::Text.unnormalize(item.text).to_s
+        puts data
+
+
+        env = {
+          "REQUEST_METHOD" => "POST",
+          "HTTP_ACCEPT"    => Mime::XML,
+          "CONTENT_TYPE"   => Mime::XML,
+          "CONTENT_LENGTH" => data.length,
+          "REQUEST_URI"    => node,
+          "QUERY_STRING"   => "",
+          "RAW_POST_DATA"  => data,
+        }
+
+        @output = $stdout # (Logging)
+        @request  = ActionController::RackRequest.new(env)
+        @response = ActionController::RackResponse.new(@request)
+
+        @controller = ActionController::Routing::Routes.recognize(@request)
+        @request.path_parameters # => hash containing info about the request
+        @controller.process(@request, @response).out(@output)
+
+        @response.body # => response
+
+        puts "Response was: #{@response.body}"
+        doc = REXML::Document.new(@response.body)
+        item_id = REXML::XPath.first(doc.root, "//id").text
+
+        resp = iq.answer
+        resp.type = :result
+        pub = resp.pubsub.first_element("publish")
+        pub.delete_element("item")
+        pub.add(Jabber::PubSub::Item.new(item_id)) # id from response
         deliver(resp)
       else
         puts "Received a pubsub message"
