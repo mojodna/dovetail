@@ -3,6 +3,7 @@ require 'switchboard'
 require 'xmpp4r'
 require 'xmpp4r/pubsub'
 require 'open-uri'
+require 'pp'
 
 class Dovetail < Switchboard::Component
   attr_reader :component, :settings
@@ -114,47 +115,24 @@ protected
       if items = iq.pubsub.first_element("items")
         items = Jabber::PubSub::Items.import(items)
         puts "Request for items on #{items.node} (#{items.max_items || "all"})"
-        puts items.to_s
-
-        env = {
-          "REQUEST_METHOD" => "GET",
-          "HTTP_ACCEPT"    => Mime::XML,
-          "CONTENT_TYPE"   => Mime::XML,
-          "REQUEST_URI"    => items.node,
-          "QUERY_STRING"   => "",
-          "RAW_POST_DATA"  => "" # new XML goes here
-        }
-
-        @output = $stdout # (Logging)
-        @request  = ActionController::RackRequest.new(env)
-        @response = ActionController::RackResponse.new(@request)
-
-        @controller = ActionController::Routing::Routes.recognize(@request)
-        @request.path_parameters # => hash containing info about the request
-        @controller.process(@request, @response).out(@output)
-
-        @response.body # => response
-
-        # # fetch items from the node url provided
-        # url = REXML::Text.unnormalize(items.node)
-        # response = open(url).read
-        # 
-        # item = Jabber::PubSub::Item.new
-        # 
-        # # attempt to treat as XML
-        # doc = REXML::Document.new(response)
-        # item.add(doc.root || REXML::CData.new(response))
-
-        item = Jabber::PubSub::Item.new
-
-        # attempt to treat as XML
-        doc = REXML::Document.new(@response.body)
-        item.add(doc.root || REXML::CData.new(@response.body))
 
         resp = iq.answer
-        resp.type = :result
-        resp.pubsub.first_element("items").add(item)
+
+        begin
+          items = get_items_from_node(items.node, items.max_items)
+
+          resp.type = :result
+          items_node = resp.pubsub.first_element("items")
+          items.each do |item|
+            items_node.add(item)
+          end
+        rescue Jabber::ServerError => e
+          resp.type = :error
+          resp.add(e.error)
+        end
+
         deliver(resp)
+
       elsif create = iq.pubsub.first_element("create")
         node = create.attributes["node"]
         puts "Request for node creation: #{node}"
@@ -175,9 +153,9 @@ protected
         data = REXML::Text.unnormalize(item.text).to_s
         puts data
 
-
+        # TODO strip down to only what's required
         env = {
-          "REQUEST_METHOD" => "POST",
+          "REQUEST_METHOD" => "PUT", # POST if it's a create
           "HTTP_ACCEPT"    => Mime::XML,
           "CONTENT_TYPE"   => Mime::XML,
           "CONTENT_LENGTH" => data.length,
@@ -191,14 +169,32 @@ protected
         @response = ActionController::RackResponse.new(@request)
 
         @controller = ActionController::Routing::Routes.recognize(@request)
-        @request.path_parameters # => hash containing info about the request
+        pp @request.path_parameters # => hash containing info about the request
+
+        unless @request.path_parameters[:id]
+          env["REQUEST_METHOD"] = "POST"
+
+          # re-route, as it was a publish to the collection
+          @request  = ActionController::RackRequest.new(env)
+          @response = ActionController::RackResponse.new(@request)
+
+          @controller = ActionController::Routing::Routes.recognize(@request)
+        end
         @controller.process(@request, @response).out(@output)
 
         @response.body # => response
 
         puts "Response was: #{@response.body}"
+        puts "Status was: #{@response.status}"
+
+        # TODO if error was 404, return node not found
+
         doc = REXML::Document.new(@response.body)
-        item_id = REXML::XPath.first(doc.root, "//id").text
+        if doc.root
+          item_id = REXML::XPath.first(doc.root, "//id").text
+        else
+          item_id = nil
+        end
 
         resp = iq.answer
         resp.type = :result
@@ -206,6 +202,34 @@ protected
         pub.delete_element("item")
         pub.add(Jabber::PubSub::Item.new(item_id)) # id from response
         deliver(resp)
+      elsif retract = iq.pubsub.first_element("retract")
+        retract = Jabber::PubSub::Retract.import(retract)
+        node = retract.node
+        puts "Retracting from node: #{node}"
+
+        resp = iq.answer
+
+        begin
+          # supporting batch queries involves wrapping a transaction around all rack requests
+          if retract.items.length > 1
+            error = Jabber::ErrorResponse.new("not-allowed")
+            error.add_element("max-items-exceeded").add_namespace("http://jabber.org/protocol/pubsub#errors")
+            raise Jabber::ServerError, error
+          end
+
+          item = retract_item_from_node(node, retract.items[0].id)
+
+          resp.type = :result
+          pub = resp.pubsub.first_element("retract")
+          pub.delete_element("item")
+          pub.add(item)
+        rescue Jabber::ServerError => e
+          resp.type = :error
+          resp.add(e.error)
+        end
+
+        deliver(resp)
+
       else
         puts "Received a pubsub message"
         puts iq.to_s
@@ -227,5 +251,76 @@ protected
     resp.type = :error
     resp.add(Jabber::ErrorResponse.new("feature-not-implemented"))
     deliver(resp)
+  end
+
+  def rack_request(env, &block)
+    output = $stdout # (Logging)
+    request  = ActionController::RackRequest.new(env)
+    response = ActionController::RackResponse.new(request)
+
+    controller = ActionController::Routing::Routes.recognize(request)
+    pp request.path_parameters # => hash containing info about the request
+    controller.process(request, response).out(output)
+
+    puts "Response was: #{response.body}"
+    puts "Status was: #{response.status}"
+
+    case response.status.to_i
+    when 200
+      yield response
+    when 404
+      raise Jabber::ServerError, Jabber::ErrorResponse.new("item-not-found")
+    else
+      puts "Unhandled status code #{response.status}"
+      raise Jabber::ServerError, Jabber::ErrorResponse.new("internal-server-error", response.status)
+    end
+  end
+
+  def get_items_from_node(node, max_items = nil)
+    env = {
+      "REQUEST_METHOD" => "GET",
+      "HTTP_ACCEPT"    => Mime::XML,
+      "REQUEST_URI"    => node,
+      "QUERY_STRING"   => max_items ? "per_page=#{max_items}" : "",
+    }
+
+    rack_request(env) do |response|
+      items = []
+
+      doc = REXML::Document.new(response.body)
+
+      # special casing for ActiveRecord's default #to_xml serialization
+      if doc.root.has_elements?
+        collection_name = doc.root.name
+        item_name = collection_name.singularize
+
+        if doc.root.elements["/#{collection_name}/#{item_name}"]
+          doc.root.each_element(item_name) do |item|
+            item_node = Jabber::PubSub::Item.new(REXML::XPath.first(item, "//id").text)
+            item_node.add(item)
+            items << item_node
+          end
+        else
+          item_node = Jabber::PubSub::Item.new(REXML::XPath.first(doc.root, "//id").text)
+          item_node.add(doc.root)
+          items << item_node
+        end
+      end
+
+      items
+    end
+  end
+
+  def retract_item_from_node(node, id)
+    env = {
+      "REQUEST_METHOD" => "DELETE",
+      "HTTP_ACCEPT"    => Mime::XML,
+      "CONTENT_TYPE"   => Mime::XML,
+      "REQUEST_URI"    => [node, id] * "/",
+    }
+
+    rack_request(env) do |response|
+      Jabber::PubSub::Item.new(id)
+    end
   end
 end
