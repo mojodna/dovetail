@@ -18,6 +18,7 @@ class Dovetail < Switchboard::Component
 
   def initialize(settings = {})
     super(settings, true)
+    plug!(DebugJack)
     @settings = DEFAULT_SETTINGS.merge(settings)
 
     @component = Jabber::Component.new(settings["component.domain"])
@@ -113,7 +114,6 @@ protected
   def iq_handler(iq)
     if iq.pubsub
       if items = iq.pubsub.first_element("items")
-        items = Jabber::PubSub::Items.import(items)
         puts "Request for items on #{items.node} (#{items.max_items || "all"})"
 
         resp = iq.answer
@@ -134,6 +134,7 @@ protected
         deliver(resp)
 
       elsif create = iq.pubsub.first_element("create")
+
         node = create.attributes["node"]
         puts "Request for node creation: #{node}"
 
@@ -143,67 +144,34 @@ protected
         resp.from = iq.to # TODO component.domain (elsewhere, too)
         resp.id = iq.id
         deliver(resp)
+
       elsif publish = iq.pubsub.first_element("publish")
-        publish = Jabber::PubSub::Publish.import(publish)
-        node = publish.node
-        puts "Publishing to node: #{node}"
-        # TODO am I publishing to an existing node or a new node?
-        item = Jabber::PubSub::Item.import(publish.first_element("item"))
-        puts "Data:"
-        data = REXML::Text.unnormalize(item.text).to_s
-        puts data
-
-        # TODO strip down to only what's required
-        env = {
-          "REQUEST_METHOD" => "PUT", # POST if it's a create
-          "HTTP_ACCEPT"    => Mime::XML,
-          "CONTENT_TYPE"   => Mime::XML,
-          "CONTENT_LENGTH" => data.length,
-          "REQUEST_URI"    => node,
-          "QUERY_STRING"   => "",
-          "RAW_POST_DATA"  => data,
-        }
-
-        @output = $stdout # (Logging)
-        @request  = ActionController::RackRequest.new(env)
-        @response = ActionController::RackResponse.new(@request)
-
-        @controller = ActionController::Routing::Routes.recognize(@request)
-        pp @request.path_parameters # => hash containing info about the request
-
-        unless @request.path_parameters[:id]
-          env["REQUEST_METHOD"] = "POST"
-
-          # re-route, as it was a publish to the collection
-          @request  = ActionController::RackRequest.new(env)
-          @response = ActionController::RackResponse.new(@request)
-
-          @controller = ActionController::Routing::Routes.recognize(@request)
-        end
-        @controller.process(@request, @response).out(@output)
-
-        @response.body # => response
-
-        puts "Response was: #{@response.body}"
-        puts "Status was: #{@response.status}"
-
-        # TODO if error was 404, return node not found
-
-        doc = REXML::Document.new(@response.body)
-        if doc.root
-          item_id = REXML::XPath.first(doc.root, "//id").text
-        else
-          item_id = nil
-        end
 
         resp = iq.answer
-        resp.type = :result
-        pub = resp.pubsub.first_element("publish")
-        pub.delete_element("item")
-        pub.add(Jabber::PubSub::Item.new(item_id)) # id from response
+
+        begin
+          # supporting batch queries involves wrapping a transaction around all rack requests
+          if publish.items.length > 1
+            error = Jabber::ErrorResponse.new("not-allowed")
+            error.add_element("max-items-exceeded").add_namespace("http://jabber.org/protocol/pubsub#errors")
+            raise Jabber::ServerError, error
+          end
+
+          item = publish_item_to_node(publish.node, publish.items[0])
+
+          resp.type = :result
+          pub = resp.pubsub.first_element("publish")
+          pub.delete_element("item")
+          pub.add(item)
+        rescue Jabber::ServerError => e
+          resp.type = :error
+          resp.add(e.error)
+        end
+
         deliver(resp)
+
       elsif retract = iq.pubsub.first_element("retract")
-        retract = Jabber::PubSub::Retract.import(retract)
+
         node = retract.node
         puts "Retracting from node: #{node}"
 
@@ -308,6 +276,40 @@ protected
       end
 
       items
+    end
+  end
+
+  def publish_item_to_node(node, item)
+    puts "Publishing to node: #{node}"
+    # TODO am I publishing to an existing node or a new node?
+
+    if item.id
+      puts "Publishing with id #{item.id}"
+    else
+      puts "Publishing with no id."
+    end
+
+    puts "Data:"
+    data = REXML::Text.unnormalize(item.text).to_s
+    puts data
+
+    env = {
+      "REQUEST_METHOD" => (item.id ? "PUT" : "POST"),
+      "CONTENT_TYPE"   => Mime::XML,
+      "CONTENT_LENGTH" => data.length,
+      "REQUEST_URI"    => [node, item.id] * "/",
+      "RAW_POST_DATA"  => data,
+    }
+
+    rack_request(env) do |response|
+      doc = REXML::Document.new(response.body)
+      if doc.root
+        id = REXML::XPath.first(doc.root, "//id").text
+      else
+        id = nil
+      end
+
+      Jabber::PubSub::Item.new(id)
     end
   end
 
